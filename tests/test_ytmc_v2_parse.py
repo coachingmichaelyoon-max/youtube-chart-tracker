@@ -188,17 +188,38 @@ class ShortsParserTest(unittest.TestCase):
 
 
 class FakeDriver:
-    """Selenium 드라이버 대신 execute_script 결과만 돌려주는 테스트용 객체."""
+    """Selenium 드라이버 대신 execute_script 결과만 돌려주는 테스트용 객체.
 
-    def __init__(self, payload, row_count=100):
+    row_counts를 주면 페이지를 열 때마다(get/refresh) 그 순서대로 행 수가 바뀐다.
+    (예: [0, 100] = 첫 로드 0행, 새로고침 후 100행)
+    """
+
+    def __init__(self, payload, row_count=100, row_counts=None):
         self.payload = payload
         self.row_count = row_count
+        self.row_counts = list(row_counts or [])
         self.title = "YouTube Music Charts"
         self.current_url = "https://charts.youtube.com/..."
         self.scripts = []
+        self.loads = 0
+        self.refreshes = 0
+        self.quit_called = False
+
+    def _advance_rows(self):
+        if self.row_counts:
+            self.row_count = self.row_counts.pop(0)
 
     def get(self, url):
+        self.loads += 1
         self.current_url = url
+        self._advance_rows()
+
+    def refresh(self):
+        self.refreshes += 1
+        self._advance_rows()
+
+    def quit(self):
+        self.quit_called = True
 
     def execute_script(self, script, *args):
         self.scripts.append(script)
@@ -210,6 +231,26 @@ class FakeDriver:
 
     def find_element(self, *args, **kwargs):
         raise RuntimeError("no element in fake driver")
+
+
+class FakeSession:
+    """DriverSession 대신 쓰는 테스트용 세션. 재시작 횟수를 기록한다."""
+
+    def __init__(self, driver):
+        self.driver = driver
+        self.restarts = 0
+        self.started = 0
+
+    def start(self):
+        self.started += 1
+        return self.driver
+
+    def restart(self):
+        self.restarts += 1
+        return self.driver
+
+    def close(self):
+        self.driver = None
 
 
 class FastTime:
@@ -229,11 +270,12 @@ class FastTime:
 class ScrapeYoutubeChartTest(unittest.TestCase):
     """브라우저 대신 FakeDriver로 scrape_youtube_chart 오케스트레이션을 검증한다."""
 
-    def run_chart(self, chart_name, fixture_name, **kwargs):
+    def run_chart(self, chart_name, fixture_name, row_counts=None, session=None, **kwargs):
         fixture = load_fixture(fixture_name)
-        driver = FakeDriver(fixture["payload"], **kwargs)
+        driver = FakeDriver(fixture["payload"], row_counts=row_counts, **kwargs)
+        session = session or FakeSession(driver)
         with mock.patch.object(main, "time", FastTime()):
-            return main.scrape_youtube_chart(chart_name, "https://charts.youtube.com/x", driver)
+            return main.scrape_youtube_chart(chart_name, "https://charts.youtube.com/x", session)
 
     def test_daily_mv_end_to_end(self):
         rows = self.run_chart("KR_Daily_Top_MV", "ytmc_v2_topvideos_kr_daily.json")
@@ -261,6 +303,116 @@ class ScrapeYoutubeChartTest(unittest.TestCase):
     def test_zero_rows_returns_empty(self):
         rows = self.run_chart("KR_Daily_Top_MV", "ytmc_v2_topvideos_kr_daily.json", row_count=0)
         self.assertEqual(rows, [])
+
+
+class ViewsHeaderTest(unittest.TestCase):
+    """조회수 컬럼 헤더를 한국어('조회수')·영어('Views'/'Weekly views') 모두 인식한다."""
+
+    def test_column_index(self):
+        self.assertEqual(main.views_column_index(["발매일", "어제", "차트에 머문 기간", "주간 조회수"]), 3)
+        self.assertEqual(
+            main.views_column_index(["Release date", "Last week", "Weeks on chart", "Weekly views"]), 3
+        )
+        self.assertEqual(main.views_column_index(["Views", "Release date"]), 0)
+        # 'Weeks on chart'를 조회수로 오인하면 안 된다.
+        self.assertEqual(main.views_column_index(["Weeks on chart", "Last week"]), -1)
+        self.assertEqual(main.views_column_index([]), -1)
+        self.assertEqual(main.views_column_index(None), -1)
+
+    def test_english_weekly_views_header(self):
+        payload = {
+            "header": ["Release date", "Last week", "Weeks on chart", "Weekly views"],
+            "rows": [
+                {"rank": "1", "title": "Dai Dai", "artist": "Shakira", "video_id": "fcnDmrtj6Sk",
+                 "metrics": ["2026-11-20", "3", "12", "2,547,365"]},
+                {"rank": "2", "title": "Song", "artist": "Artist", "video_id": "",
+                 "metrics": ["2026-11-18", "-", "4", "1.5M"]},
+            ],
+        }
+        rows = main.yt_payload_to_rows("US_Weekly_Top_MV", payload)
+        self.assertEqual([r["Views"] for r in rows], [2547365, 1500000])
+
+    def test_english_views_column_not_last(self):
+        # 조회수가 마지막 컬럼이 아니여도 헤더 위치를 보고 고른다.
+        payload = {
+            "header": ["Views", "Release date", "Weeks on chart"],
+            "rows": [
+                {"rank": "1", "title": "Song", "artist": "Artist", "video_id": "",
+                 "metrics": ["987,654", "2026-11-20", "8"]},
+            ],
+        }
+        self.assertEqual(main.yt_payload_to_rows("TEST", payload)[0]["Views"], 987654)
+
+    def test_korean_header_still_works(self):
+        payload = {
+            "header": ["발매일", "어제", "차트에 머문 기간", "주간 조회수"],
+            "rows": [
+                {"rank": "1", "title": "곡", "artist": "가수", "video_id": "",
+                 "metrics": ["2026-11-20", "1", "122", "773,660"]},
+            ],
+        }
+        self.assertEqual(main.yt_payload_to_rows("KR_Daily_Top_MV", payload)[0]["Views"], 773660)
+
+
+class RetryTest(unittest.TestCase):
+    """차트 테이블이 0행일 때 바로 포기하지 않고 새로고침·드라이버 재시작으로 재시도한다."""
+
+    def run_scrape(self, row_counts, chart="KR_Daily_Top_MV"):
+        payload = load_fixture("ytmc_v2_topvideos_kr_daily.json")["payload"]
+        driver = FakeDriver(payload, row_counts=row_counts)
+        session = FakeSession(driver)
+        with mock.patch.object(main, "time", FastTime()):
+            rows = main.scrape_youtube_chart(chart, "https://charts.youtube.com/x", session)
+        return rows, driver, session
+
+    def test_refreshes_once_then_succeeds(self):
+        rows, driver, session = self.run_scrape([0, 100])
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(rows[0]["Views"], 739305)
+        self.assertEqual((driver.loads, driver.refreshes, session.restarts), (1, 1, 0))
+
+    def test_restarts_driver_on_last_attempt(self):
+        rows, driver, session = self.run_scrape([0, 0, 100])
+        self.assertEqual(len(rows), 4)
+        self.assertEqual((driver.loads, driver.refreshes, session.restarts), (2, 1, 1))
+
+    def test_gives_up_after_all_attempts(self):
+        rows, driver, session = self.run_scrape([0, 0, 0])
+        self.assertEqual(rows, [])
+        self.assertEqual((driver.loads, driver.refreshes, session.restarts), (2, 1, 1))
+
+
+class DriverOptionsTest(unittest.TestCase):
+    """구형 User-Agent 고정이 다시 들어오지 않도록 한다."""
+
+    def test_no_stale_user_agent(self):
+        captured = {}
+
+        class FakeOptions:
+            def __init__(self):
+                self.args = []
+                self.experimental = {}
+
+            def add_argument(self, arg):
+                self.args.append(arg)
+
+            def add_experimental_option(self, key, value):
+                self.experimental[key] = value
+
+        fake_options = FakeOptions()
+        fake_driver = types.SimpleNamespace(
+            set_page_load_timeout=lambda seconds: captured.update(timeout=seconds)
+        )
+
+        with mock.patch.object(main, "Options", lambda: fake_options), \
+                mock.patch.object(main, "Service", lambda *a, **k: None), \
+                mock.patch.object(main, "ChromeDriverManager", lambda *a, **k: mock.Mock(install=lambda: "chromedriver")), \
+                mock.patch.object(main.webdriver, "Chrome", lambda service=None, options=None: fake_driver):
+            main.get_driver()
+
+        self.assertEqual([a for a in fake_options.args if "user-agent" in a.lower()], [])
+        self.assertIn("--headless=new", fake_options.args)
+        self.assertEqual(captured["timeout"], main.PAGE_LOAD_TIMEOUT_SECONDS)
 
 
 if __name__ == "__main__":
