@@ -1,0 +1,38 @@
+{
+  "_source": "https://charts.youtube.com/charts/TopVideos/kr/daily (2026-11-26 확인, ytmc-v2-app Shadow DOM에서 execute_script로 추출)",
+  "chart": "KR_Daily_Top_MV",
+  "payload": {
+    "row_count": 100,
+    "header": ["발매일", "어제", "차트에 머문 기간", "주간 조회수"],
+    "rows": [
+      {
+        "rank": "1",
+        "title": "꿈꾸던 어른이 되었나요?",
+        "artist": "머무르",
+        "video_id": "GxChUrrY4bc",
+        "metrics": ["2026년 6월 23일", "1", "121", "739,305"]
+      },
+      {
+        "rank": "2",
+        "title": "晩餐歌 (만찬가) Cover",
+        "artist": "IVE (아이브)",
+        "video_id": "QsqQRGR_bcQ",
+        "metrics": ["2026년 11월 23일", "28", "2", "569,725"]
+      },
+      {
+        "rank": "4",
+        "title": "TAEYEON 태연 'Unspecial' Highlight Medley",
+        "artist": "태연",
+        "video_id": "gVQJE5yfZxg",
+        "metrics": ["2026년 11월 23일", "-", "1", "204,071"]
+      },
+      {
+        "rank": "8",
+        "title": "NEON",
+        "artist": "A2O LITE, A2O",
+        "video_id": "D968qfUZMUE",
+        "metrics": ["2026년 10월 12일", "6", "38", "147,908"]
+      }
+    ]
+  }
+}

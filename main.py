@@ -55,13 +55,26 @@ EXTRA_URLS = {
 }
 
 # ================= 유틸리티 함수 =================
+
 def parse_count_strict(text):
+    """차트 표기를 정수로 변환한다.
+
+    '739,305' / '10,546,503' / '3.9만' / '1.2천' / '<10K' / '1.5M' 형태를 모두 처리한다.
+    '<10K' 처럼 상한만 표시된 값은 표시된 경계값(10000)으로 계산한다.
+    """
     if not text: return 0
-    t = str(text).lower().strip().replace(',', '')
+    t = str(text).lower().strip().replace(',', '').replace(' ', '')
+    t = re.sub(r'^[<>≈~]+', '', t)
+
     multiplier = 1
-    if 'k' in t: multiplier = 1_000
-    elif 'm' in t: multiplier = 1_000_000
-    elif 'b' in t: multiplier = 1_000_000_000
+    # 한국어 단위 → 영문 단위 순서로 확인 (긴 단위 우선)
+    for token, multi in (('조', 10**12), ('억', 10**8), ('만', 10**4), ('천', 10**3),
+                         ('b', 10**9), ('m', 10**6), ('k', 10**3)):
+        if token in t:
+            multiplier = multi
+            t = t.replace(token, '')
+            break
+
     clean = re.sub(r'[^\d.]', '', t)
     if not clean: return 0
     try:
@@ -95,17 +108,256 @@ def get_driver():
     return webdriver.Chrome(service=service, options=chrome_options)
 
 # ================= 유튜브 API & 파싱 =================
+
+# charts.youtube.com은 2026년 11월 `ytmc-v2-app`으로 개편되면서
+# 차트 테이블(ytmc-entry-row)과 그 안의 순위/제목/아티스트/조회수가
+# 전부 중첩 Shadow DOM 안으로 들어갔다.
+# driver.page_source(=document.documentElement.outerHTML)에는 Shadow DOM 내부가
+# 직렬화되지 않아 BeautifulSoup로는 행도 값도 읽을 수 없다.
+# → Selenium execute_script로 document의 모든 shadowRoot를 재귀 순회해 직접 뽑는다.
+
+# 모든 shadowRoot를 순회하며 ytmc-entry-row 개수만 센다 (렌더링/스크롤 대기용)
+YT_ROW_COUNT_JS = """
+return (function () {
+  var count = 0;
+  var walk = function (root) {
+    if (!root.querySelectorAll) return;
+    count += root.querySelectorAll('ytmc-entry-row').length;
+    var all = root.querySelectorAll('*');
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].shadowRoot) walk(all[i].shadowRoot);
+    }
+  };
+  walk(document);
+  return count;
+})();
+"""
+
+# 차트 테이블 헤더(컬럼명)와 행 데이터를 통째로 뽑아 JSON으로 돌려준다.
+# 반환: {row_count: int, header: [컬럼명...], rows: [{rank, title, artist, video_id, metrics:[...]}]}
+# metrics는 header와 같은 순서/개수로 대응된다 (예: 발매일, 어제, 차트에 머문 기간, 주간 조회수).
+YT_CHART_EXTRACT_JS = """
+var collectRows = function (root) {
+  var rows = [];
+  var walk = function (el) {
+    if (!el.querySelectorAll) return;
+    var found = el.querySelectorAll('ytmc-entry-row');
+    for (var i = 0; i < found.length; i++) rows.push(found[i]);
+    var all = el.querySelectorAll('*');
+    for (var j = 0; j < all.length; j++) {
+      if (all[j].shadowRoot) walk(all[j].shadowRoot);
+    }
+  };
+  walk(root);
+  return rows;
+};
+
+var findHeaderMetrics = function (root) {
+  var result = null;
+  var walk = function (el) {
+    if (result || !el.querySelectorAll) return;
+    var hs = el.querySelectorAll('.table-header-metric');
+    if (hs.length) {
+      result = [];
+      for (var i = 0; i < hs.length; i++) result.push(hs[i].textContent.trim());
+      return;
+    }
+    var all = el.querySelectorAll('*');
+    for (var j = 0; j < all.length; j++) {
+      if (all[j].shadowRoot) {
+        walk(all[j].shadowRoot);
+        if (result) return;
+      }
+    }
+  };
+  walk(root);
+  return result || [];
+};
+
+var videoIdOf = function (root) {
+  var candidates = [
+    root.querySelector('#entity-title'),
+    root.querySelector('img#thumbnail'),
+    root.querySelector('img.tracks-thumbnail')
+  ];
+  for (var i = 0; i < candidates.length; i++) {
+    var el = candidates[i];
+    if (!el) continue;
+    var ep = el.getAttribute('endpoint');
+    if (ep) {
+      try {
+        var j = JSON.parse(ep);
+        var url = (j.urlEndpoint && j.urlEndpoint.url) || '';
+        var m = url.match(/[?&]v=([A-Za-z0-9_-]{11})/);
+        if (m) return m[1];
+      } catch (e) {}
+    }
+    var src = el.getAttribute('src');
+    if (src) {
+      var m2 = src.match(/[/]vi(?:_webp)?[/]([A-Za-z0-9_-]{11})/);
+      if (m2) return m2[1];
+    }
+  }
+  var m3 = root.innerHTML.match(/[?&]v=([A-Za-z0-9_-]{11})/);
+  return m3 ? m3[1] : '';
+};
+
+return (function () {
+  var rows = collectRows(document);
+  var header = findHeaderMetrics(document);
+  var out = [];
+  for (var i = 0; i < rows.length; i++) {
+    var light = rows[i];
+    var root = light.shadowRoot || light;
+    var titleEl = root.querySelector('#entity-title') || root.querySelector('.title');
+    var rankEl = root.querySelector('#rank');
+
+    var artists = [];
+    var artistEls = root.querySelectorAll('span.artistName');
+    for (var a = 0; a < artistEls.length; a++) artists.push(artistEls[a].textContent.trim());
+    if (!artists.length) {
+      var sub = root.querySelector('#artist-names') || root.querySelector('.subtitle');
+      if (sub) artists.push(sub.textContent.trim());
+    }
+
+    var metrics = [];
+    var metricEls = root.querySelectorAll('.metric');
+    for (var k = 0; k < metricEls.length; k++) metrics.push(metricEls[k].textContent.trim());
+
+    out.push({
+      rank: rankEl ? rankEl.textContent.trim() : '',
+      title: titleEl ? titleEl.textContent.trim() : '',
+      artist: artists.filter(function (x) { return x; }).join(', '),
+      video_id: videoIdOf(root),
+      metrics: metrics
+    });
+  }
+  return { row_count: rows.length, header: header, rows: out };
+})();
+"""
+
+def _yt_row_count(driver):
+    try:
+        return int(driver.execute_script(YT_ROW_COUNT_JS) or 0)
+    except Exception:
+        return 0
+
+def _wait_for_yt_rows(driver, timeout=25):
+    """차트 테이블(Shadow DOM 안의 ytmc-entry-row)이 렌더링될 때까지 기다린다."""
+    end = time.time() + timeout
+    while time.time() < end:
+        count = _yt_row_count(driver)
+        if count:
+            return count
+        time.sleep(0.5)
+    return 0
+
+def _scroll_yt_chart(driver, max_rounds=12, pause=0.4):
+    """행이 지연 렌더링되는 경우를 대비해 아래로 내리며 행 수가 늘어나는지 확인한다."""
+    last = _yt_row_count(driver)
+    for _ in range(max_rounds):
+        driver.execute_script("window.scrollBy(0, Math.floor(window.innerHeight * 0.9));")
+        time.sleep(pause)
+        current = _yt_row_count(driver)
+        at_bottom = driver.execute_script(
+            "return (window.innerHeight + window.pageYOffset) >= (document.body.scrollHeight - 5);"
+        )
+        if at_bottom and current == last:
+            break
+        last = current
+    driver.execute_script("window.scrollTo(0, 0);")
+
+def yt_payload_to_rows(chart_name, payload):
+    """execute_script로 뽑은 ytmc-v2-app payload를 기존 출력 스키마로 변환한다.
+
+    출력 스키마는 기존과 동일: Date, Chart, Rank, Title, Artist, Video_ID, Views.
+    조회수는 헤더에서 '조회수'(예: 주간 조회수) 컬럼 위치를 찾아 그 위치의 metric을 쓴다.
+    브라우저 없이 payload만으로 동작하므로 단위 테스트 대상이다.
+    """
+    payload = payload or {}
+    rows = payload.get("rows") or []
+    header = payload.get("header") or []
+
+    views_idx = -1
+    for i, name in enumerate(header):
+        if "조회수" in str(name):
+            views_idx = i
+            break
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    data_list = []
+
+    for row in rows:
+        title = clean_text(row.get("title") or "")
+        if not title:
+            continue
+
+        metrics = [clean_text(m) for m in (row.get("metrics") or [])]
+        if 0 <= views_idx < len(metrics):
+            views_raw = metrics[views_idx]
+        elif metrics:
+            views_raw = metrics[-1]
+        else:
+            views_raw = ""
+
+        rank_txt = str(row.get("rank") or "").strip()
+        data_list.append({
+            "Date": today,
+            "Chart": chart_name,
+            "Rank": int(rank_txt) if rank_txt.isdigit() else len(data_list) + 1,
+            "Title": title,
+            "Artist": clean_text(row.get("artist") or ""),
+            "Video_ID": row.get("video_id") or "",
+            "Views": parse_count_strict(views_raw)
+        })
+
+    return data_list
+
+# 영상 페이지의 'Shorts 생성 수' 표기 (로케일별)
+SHORTS_KO_PATTERN = re.compile(r'Shorts\s*동영상\s*([\d.,]+)\s*(만|천|억|조)?')
+SHORTS_EN_PATTERN = re.compile(r'([\d.,]+)\s*([KMB])\s*Shorts', re.IGNORECASE)
+SHORTS_LOOSE_PATTERN = re.compile(r'Shorts\s*([\d.,]+)\s*(만|천|억|조|K|M|B)?', re.IGNORECASE)
+
+def parse_shorts_creation_count(body_text):
+    """영상 페이지 텍스트에서 Shorts 생성 수를 뽑는다.
+
+    'Shorts 동영상 3.9만개'(ko) / '39K Shorts'(en) 둘 다 처리한다. 못 찾으면 0.
+    """
+    if not body_text:
+        return 0
+    match = SHORTS_KO_PATTERN.search(body_text)
+    if match:
+        return parse_count_strict(match.group(1) + (match.group(2) or ""))
+    match = SHORTS_EN_PATTERN.search(body_text)
+    if match:
+        return parse_count_strict(match.group(1) + match.group(2))
+    match = SHORTS_LOOSE_PATTERN.search(body_text)
+    if match:
+        return parse_count_strict(match.group(1) + (match.group(2) or ""))
+    return 0
+
 def get_shorts_creation_count(driver, video_id):
+    """Shorts 차트용 'Shorts 생성 수'를 영상의 source 페이지에서 읽는다."""
     if not video_id: return 0
     url = f"https://www.youtube.com/source/{video_id}/shorts"
     try:
         driver.get(url)
-        time.sleep(1.5) # 대기 시간 소폭 증가
-        body_text = driver.find_element(By.TAG_NAME, "body").text
-        match = re.search(r'([\d,.]+[KMB]?)\s*Shorts', body_text, re.IGNORECASE)
-        if match:
-            return parse_count_strict(match.group(1))
-        return 0
+
+        # 생성 수 문구가 그려질 때까지 짧게 기다린다 (최대 8초)
+        body_text = ""
+        end = time.time() + 8
+        while time.time() < end:
+            try:
+                body_text = driver.find_element(By.TAG_NAME, "body").text
+            except Exception:
+                body_text = ""
+            if (SHORTS_KO_PATTERN.search(body_text)
+                    or SHORTS_EN_PATTERN.search(body_text)
+                    or SHORTS_LOOSE_PATTERN.search(body_text)):
+                break
+            time.sleep(0.5)
+
+        return parse_shorts_creation_count(body_text)
     except: return 0
 
 def get_views_from_api(video_ids):
@@ -127,91 +379,56 @@ def get_views_from_api(video_ids):
 
 # ================= 크롤러 메인 로직 =================
 
-# 1. 유튜브 차트 크롤러 (안전장치 추가)
+# 1. 유튜브 차트 크롤러 (ytmc-v2-app Shadow DOM 대응)
 def scrape_youtube_chart(chart_name, url, driver):
     print(f"🚀 Scraping YouTube: {chart_name}...")
     try:
         driver.get(url)
-        time.sleep(5) # 초기 로딩 대기
-        
-        # [수정] 0개가 나오면 스크롤 한 번 더 시도
-        last_height = driver.execute_script("return document.body.scrollHeight")
-        for _ in range(5): # 스크롤 시도 횟수
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(1)
-            new_height = driver.execute_script("return document.body.scrollHeight")
-            if new_height == last_height: break
-            last_height = new_height
-        
-        time.sleep(2) # 렌더링 안정화
-        
-        soup = BeautifulSoup(driver.page_source, 'html.parser')
-        rows = soup.find_all('ytmc-entry-row')
-        
-        # [디버깅] 만약 rows가 0개면 페이지 타이틀 출력 (차단 여부 확인)
-        if len(rows) == 0:
-            print(f"   ⚠️ Warning: 0 rows found. Page Title: {driver.title}")
 
-        data_list = []
-        today = datetime.now().strftime("%Y-%m-%d")
-        
-        is_trending = "Trending" in chart_name
-        is_shorts = "Shorts" in chart_name
-        is_daily_mv = "Daily_Top_MV" in chart_name
-        is_weekly = "Weekly" in chart_name
-        
-        for idx, row in enumerate(rows):
-            try:
-                title_div = row.find('div', class_='title')
-                if not title_div: continue
-                title = title_div.get_text(strip=True)
-                
-                artist_tag = row.find('span', class_='artistName') or row.find('div', class_='subtitle')
-                artist = artist_tag.get_text(strip=True) if artist_tag else ""
-                
-                row_html = str(row)
-                vid = ""
-                # Video ID 추출 패턴 강화
-                match = re.search(r'watch\?v=([a-zA-Z0-9_-]{11})', row_html)
-                if match: 
-                    vid = match.group(1)
-                else:
-                    # 썸네일에서 추출 시도
-                    img = row.find('img')
-                    if img and 'src' in img.attrs:
-                         m = re.search(r'/vi(?:_webp)?/([a-zA-Z0-9_-]{11})', img['src'])
-                         if m: vid = m.group(1)
+        row_count = _wait_for_yt_rows(driver)
+        if row_count == 0:
+            print(f"   ⚠️ Warning: ytmc-entry-row 0개. Page Title: {driver.title} / URL: {driver.current_url}")
+            return []
 
-                final_views = 0
-                
-                if is_shorts:
-                    # 쇼츠는 생성수 별도 추출 (API 호출 최소화)
-                    if vid: final_views = get_shorts_creation_count(driver, vid)
-                else:
-                    # 일반 조회수 파싱
-                    if is_daily_mv:
-                        hidden_divs = row.find_all('div', class_='tablet-non-displayed-metric')
-                        max_val = 0
-                        for h in hidden_divs:
-                            val = parse_count_strict(h.get_text(strip=True))
-                            if val > max_val: max_val = val
-                        final_views = max_val
-                    elif is_weekly:
-                        metrics = row.find_all('div', class_='metric')
-                        if metrics:
-                            final_views = parse_count_strict(metrics[-1].get_text(strip=True))
-                
-                data_list.append({
-                    "Date": today, "Chart": chart_name, "Rank": idx+1,
-                    "Title": title, "Artist": artist, "Video_ID": vid, "Views": final_views
-                })
-            except Exception as row_e: continue
-            
+        _scroll_yt_chart(driver)
+        payload = driver.execute_script(YT_CHART_EXTRACT_JS) or {}
+        rows = payload.get("rows") or []
+        header = payload.get("header") or []
+        print(f"   -> DOM rows: {len(rows)} / columns: {header}")
+
+        data_list = yt_payload_to_rows(chart_name, payload)
+        if data_list:
+            sample = data_list[0]
+            print(f"   -> 예시: #{sample['Rank']} {sample['Title'][:40]} / {sample['Artist'][:20]} / {sample['Video_ID']} / Views={sample['Views']}")
+
+        # '<10K' 처럼 상한만 표시된 조회수는 경계값으로 계산된다는 점을 로그로 남긴다.
+        if header:
+            views_idx = next((i for i, h in enumerate(header) if '조회수' in str(h)), -1)
+            if views_idx >= 0:
+                bounded = sum(
+                    1 for row in (payload.get('rows') or [])
+                    if views_idx < len(row.get('metrics') or []) and '<' in str(row['metrics'][views_idx])
+                )
+                if bounded:
+                    print(f"   -> 상한 표기('<10K') 행: {bounded}개 → 표시된 경계값으로 계산")
+
+        # Shorts 차트는 기존과 동일하게 'Shorts 생성 수'를 우선 사용한다.
+        # (실패하면 DOM의 주간 조회수 값이 그대로 남는다)
+        if "Shorts" in chart_name:
+            filled = 0
+            for item in data_list:
+                creations = get_shorts_creation_count(driver, item["Video_ID"])
+                if creations:
+                    item["Views"] = creations
+                    filled += 1
+            print(f"   -> Shorts 생성 수 확보: {filled}/{len(data_list)}")
+
         print(f"   -> Captured {len(data_list)} items.")
         return data_list
 
     except Exception as e:
         print(f"❌ YouTube Error ({chart_name}): {e}")
+        print(traceback.format_exc())
         return []
 
 # 2. 빌보드 크롤러 (안전장치 강화판 + 날짜는 오늘 날짜로 원상복구)
@@ -452,13 +669,14 @@ if __name__ == "__main__":
             # YouTube
             for name, url in TARGET_URLS.items():
                 chart_data = scrape_youtube_chart(name, url, driver)
-                # Trending API 보정
+                # Trending 보정: API 키가 만료(API key expired) 상태라 DOM 조회수를 우선하고,
+                # DOM에서 값을 못 얻은 경우(Views=0)에만 API 값을 보충으로 쓴다.
                 if "Trending" in name:
                     ids = [d["Video_ID"] for d in chart_data if d["Video_ID"]]
                     if ids:
                         api_stats = get_views_from_api(ids)
                         for item in chart_data:
-                            if item["Video_ID"] in api_stats:
+                            if not item["Views"] and item["Video_ID"] in api_stats:
                                 item["Views"] = api_stats[item["Video_ID"]]
                 final_data.extend(chart_data)
             

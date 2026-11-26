@@ -1,0 +1,31 @@
+{
+  "_source": "https://charts.youtube.com/charts/TrendingVideos/kr/RightNow (2026-11-26 확인, ytmc-v2-app Shadow DOM에서 execute_script로 추출). 가운데 두 컬럼 헤더는 빈 문자열이다(화면에서 숨김).",
+  "chart": "KR_Daily_Trending",
+  "payload": {
+    "row_count": 30,
+    "header": ["발매일", "", "", "주간 조회수"],
+    "rows": [
+      {
+        "rank": "1",
+        "title": "기립 (GiiiRIP)",
+        "artist": "BIGBANG",
+        "video_id": "IQI2qaqHFlg",
+        "metrics": ["2026년 11월 19일", "-", "0", "<10K"]
+      },
+      {
+        "rank": "2",
+        "title": "알고있나요 (2026 ver.)",
+        "artist": "SOMEDAY (썸데이)",
+        "video_id": "LOLXD85SThc",
+        "metrics": ["2026년 11월 17일", "-", "0", "<10K"]
+      },
+      {
+        "rank": "30",
+        "title": "UP",
+        "artist": "ATEEZ",
+        "video_id": "KYGb4thFNqk",
+        "metrics": ["2026년 11월 12일", "-", "0", "<10K"]
+      }
+    ]
+  }
+}

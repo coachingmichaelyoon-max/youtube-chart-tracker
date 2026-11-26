@@ -1,0 +1,31 @@
+{
+  "_source": "https://charts.youtube.com/charts/TopSongs/kr/weekly (2026-11-26 확인, ytmc-v2-app Shadow DOM에서 execute_script로 추출)",
+  "chart": "KR_Weekly_Top_Songs",
+  "payload": {
+    "row_count": 100,
+    "header": ["발매일", "지난주", "차트 지속기간(주)", "주간 조회수"],
+    "rows": [
+      {
+        "rank": "1",
+        "title": "꿈꾸던 어른이 되었나요?",
+        "artist": "머무르",
+        "video_id": "GxChUrrY4bc",
+        "metrics": ["2026년 6월 23일", "2", "15", "10,546,503"]
+      },
+      {
+        "rank": "2",
+        "title": "NEON",
+        "artist": "A2O, A2O LITE",
+        "video_id": "D968qfUZMUE",
+        "metrics": ["2026년 10월 12일", "3", "6", "6,065,034"]
+      },
+      {
+        "rank": "16",
+        "title": "FIRESTARTER (feat. Sophie Powers, 미연 (MIYEON) & 소연 (SOYEON))",
+        "artist": "K/DA, League of Legends, i-dle (아이들), Mimi Webb",
+        "video_id": "Mmw-PpWhKFg",
+        "metrics": ["2026년 9월 4일", "15", "5", "1,425,843"]
+      }
+    ]
+  }
+}
