@@ -24,7 +24,13 @@ WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbyFm0Xu2BY3T_JcNgQqQssOhY
 # 2. 유튜브 API 키
 YOUTUBE_API_KEY = "AIzaSyDFFZNYygA85qp5p99qUG2Mh8Kl5qoLip4"
 
-# 3. 크롤링 대상 URL
+# 3. 브라우저/재시도 설정
+PAGE_LOAD_TIMEOUT_SECONDS = 60   # 한 페이지 로드에 걸 수 있는 최대 시간(무한 대기 방지)
+YT_ROW_WAIT_SECONDS = 25        # 한 번의 시도에서 차트 테이블(ytmc-entry-row)을 기다리는 시간
+YT_MAX_ATTEMPTS = 3             # 최초 1회 + 페이지 새로고침 1회 + 드라이버 재시작 1회
+YT_DEFAULT_TITLE = "YouTube Music Charts"   # 차트 SPA가 안 그려졌을 때의 기본 타이틀
+
+# 4. 크롤링 대상 URL
 TARGET_URLS = {
     "KR_Daily_Trending": "https://charts.youtube.com/charts/TrendingVideos/kr/RightNow",
     "US_Daily_Trending": "https://charts.youtube.com/charts/TrendingVideos/us/RightNow",
@@ -101,11 +107,18 @@ def get_driver():
     chrome_options.add_argument("--disable-blink-features=AutomationControlled") 
     chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
     chrome_options.add_experimental_option('useAutomationExtension', False)
-    
-    chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36")
-    
+
+    # User-Agent를 Chrome/115.0.0.0으로 고정하던 설정은 제거했다.
+    # 실제 크롬 버전과 어긋난 구형 UA로 요청하면 charts.youtube.com이 차트 SPA를
+    # 그리지 않고 'YouTube Music Charts' 기본 타이틀에 머문 채 reCAPTCHA 단계에서
+    # 멈춰, 테이블(ytmc-entry-row)이 0개로 남았다. --headless=new는 실제 브라우저
+    # 버전의 UA를 그대로 쓰므로 별도 지정이 필요 없다.
+
     service = Service(ChromeDriverManager().install())
-    return webdriver.Chrome(service=service, options=chrome_options)
+    driver = webdriver.Chrome(service=service, options=chrome_options)
+    # chromedriver가 응답 없이 120초씩 매달리는 경우가 있어 페이지 로드에 상한을 둔다.
+    driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT_SECONDS)
+    return driver
 
 # ================= 유튜브 API & 파싱 =================
 
@@ -115,6 +128,9 @@ def get_driver():
 # driver.page_source(=document.documentElement.outerHTML)에는 Shadow DOM 내부가
 # 직렬화되지 않아 BeautifulSoup로는 행도 값도 읽을 수 없다.
 # → Selenium execute_script로 document의 모든 shadowRoot를 재귀 순회해 직접 뽑는다.
+
+# 조회수 컬럼 헤더 이름 (한국어 '주간 조회수', 영어 'Weekly views'/'Views' 등)
+VIEWS_HEADER_PATTERN = re.compile(r'조회수|\bviews?\b', re.IGNORECASE)
 
 # 모든 shadowRoot를 순회하며 ytmc-entry-row 개수만 센다 (렌더링/스크롤 대기용)
 YT_ROW_COUNT_JS = """
@@ -242,7 +258,7 @@ def _yt_row_count(driver):
     except Exception:
         return 0
 
-def _wait_for_yt_rows(driver, timeout=25):
+def _wait_for_yt_rows(driver, timeout=YT_ROW_WAIT_SECONDS):
     """차트 테이블(Shadow DOM 안의 ytmc-entry-row)이 렌더링될 때까지 기다린다."""
     end = time.time() + timeout
     while time.time() < end:
@@ -267,22 +283,131 @@ def _scroll_yt_chart(driver, max_rounds=12, pause=0.4):
         last = current
     driver.execute_script("window.scrollTo(0, 0);")
 
+class DriverSession:
+    """Selenium 드라이버 한 개를 들고 있다가, 필요하면 새로 띄운다.
+
+    ChromeDriver가 응답을 멈추는 경우가 있어 차트 로딩이 계속 실패하면
+    드라이버를 재시작한다. 재시작하면 참조가 바뀌므로 각 차트는 항상
+    session.driver에서 현재 드라이버를 얻어 쓴다.
+    """
+
+    def __init__(self, driver_factory=None):
+        self._factory = driver_factory or get_driver
+        self.driver = None
+
+    def start(self):
+        self.close()
+        self.driver = self._factory()
+        return self.driver
+
+    def restart(self):
+        print("   ♻️ 드라이버 재시작")
+        return self.start()
+
+    def close(self):
+        driver, self.driver = self.driver, None
+        if driver is not None:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+
+def _open_page(driver, url):
+    """페이지를 연다. 페이지 로드 타임아웃/드라이버 오류는 다음 시도로 넘긴다."""
+    try:
+        driver.get(url)
+        return True
+    except Exception as e:
+        print(f"   ⚠️ 페이지 열기 실패: {e}")
+        return False
+
+
+def _reload_page(driver, url):
+    """새로고침. 드라이버가 새로고침을 못 하면 주소로 다시 연다."""
+    try:
+        driver.refresh()
+        return True
+    except Exception:
+        return _open_page(driver, url)
+
+
+def _load_yt_chart(chart_name, url, session, attempts=YT_MAX_ATTEMPTS):
+    """차트 페이지를 열고 ytmc-entry-row가 그려질 때까지 기다린다.
+
+    charts.youtube.com은 reCAPTCHA 검증 뒤에 데이터가 붙어서, 25초 안에 테이블이
+    그려지지 않는 경우가 있다(예전에는 그대로 0행 처리하고 포기했다).
+    그래서 (1) 페이지를 새로고침해 한 번 더 기다리고,
+    (2) 마지막에는 드라이버를 재시작해 마지막으로 한 번 더 시도한다.
+
+    반환: (사용한 driver, row_count). row_count가 0이면 끝까지 실패한 것이다.
+    """
+    if session.driver is None:
+        try:
+            session.start()
+        except Exception as e:
+            print(f"   ❌ 드라이버 생성 실패: {e}")
+            return None, 0
+
+    driver = session.driver
+    for attempt in range(1, attempts + 1):
+        if attempt == 1:
+            _open_page(driver, url)
+        elif attempt == attempts:
+            # 마지막 수단: 브라우저 자체를 새로 띄운다.
+            try:
+                driver = session.restart()
+            except Exception as e:
+                print(f"   ❌ 드라이버 재시작 실패: {e}")
+                return driver, 0
+            _open_page(driver, url)
+        else:
+            print(f"   🔄 재시도 {attempt - 1}: 페이지 새로고침")
+            _reload_page(driver, url)
+
+        row_count = _wait_for_yt_rows(driver)
+        if row_count:
+            if attempt > 1:
+                print(f"   ✅ 재시도 {attempt - 1}회 후 로드: rows={row_count}")
+            return driver, row_count
+
+        try:
+            title = driver.title
+        except Exception:
+            title = "(unknown)"
+        # 기본 타이틀에 머물러 있으면 차트 SPA가 아직 안 그려진 것이다.
+        if str(title).strip() == YT_DEFAULT_TITLE:
+            print(f"   ⚠️ 시도 {attempt}/{attempts}: 차트 테이블 0개 · 기본 타이틀 유지('{title}') / URL: {url}")
+        else:
+            print(f"   ⚠️ 시도 {attempt}/{attempts}: 차트 테이블 0개. Page Title: {title} / URL: {url}")
+
+    return driver, 0
+
+
+def views_column_index(header):
+    """헤더에서 조회수 컬럼 위치를 찾는다.
+
+    GitHub Actions(영어 로케일)에서는 'Weekly views'/'Views', 국내 로케일에서는
+    '주간 조회수'처럼 찍히므로 둘 다 같은 컬럼으로 인식한다. 없으면 -1.
+    """
+    for i, name in enumerate(header or []):
+        if VIEWS_HEADER_PATTERN.search(str(name)):
+            return i
+    return -1
+
+
 def yt_payload_to_rows(chart_name, payload):
     """execute_script로 뽑은 ytmc-v2-app payload를 기존 출력 스키마로 변환한다.
 
     출력 스키마는 기존과 동일: Date, Chart, Rank, Title, Artist, Video_ID, Views.
-    조회수는 헤더에서 '조회수'(예: 주간 조회수) 컬럼 위치를 찾아 그 위치의 metric을 쓴다.
+    조회수는 헤더에서 '조회수'(예: 주간 조회수) 또는 영어 'Views'(예: Weekly views)
+    컬럼 위치를 찾아 그 위치의 metric을 쓴다.
     브라우저 없이 payload만으로 동작하므로 단위 테스트 대상이다.
     """
     payload = payload or {}
     rows = payload.get("rows") or []
     header = payload.get("header") or []
-
-    views_idx = -1
-    for i, name in enumerate(header):
-        if "조회수" in str(name):
-            views_idx = i
-            break
+    views_idx = views_column_index(header)
 
     today = datetime.now().strftime("%Y-%m-%d")
     data_list = []
@@ -380,14 +505,12 @@ def get_views_from_api(video_ids):
 # ================= 크롤러 메인 로직 =================
 
 # 1. 유튜브 차트 크롤러 (ytmc-v2-app Shadow DOM 대응)
-def scrape_youtube_chart(chart_name, url, driver):
+def scrape_youtube_chart(chart_name, url, session):
     print(f"🚀 Scraping YouTube: {chart_name}...")
     try:
-        driver.get(url)
-
-        row_count = _wait_for_yt_rows(driver)
+        driver, row_count = _load_yt_chart(chart_name, url, session)
         if row_count == 0:
-            print(f"   ⚠️ Warning: ytmc-entry-row 0개. Page Title: {driver.title} / URL: {driver.current_url}")
+            print(f"   ❌ {chart_name}: {YT_MAX_ATTEMPTS}회 시도 후에도 차트 테이블이 없어 건너뜀")
             return []
 
         _scroll_yt_chart(driver)
@@ -401,16 +524,18 @@ def scrape_youtube_chart(chart_name, url, driver):
             sample = data_list[0]
             print(f"   -> 예시: #{sample['Rank']} {sample['Title'][:40]} / {sample['Artist'][:20]} / {sample['Video_ID']} / Views={sample['Views']}")
 
+        views_idx = views_column_index(header)
+        if header and views_idx < 0:
+            print("   ⚠️ 조회수 컬럼을 찾지 못해 마지막 컬럼을 조회수로 사용")
+
         # '<10K' 처럼 상한만 표시된 조회수는 경계값으로 계산된다는 점을 로그로 남긴다.
-        if header:
-            views_idx = next((i for i, h in enumerate(header) if '조회수' in str(h)), -1)
-            if views_idx >= 0:
-                bounded = sum(
-                    1 for row in (payload.get('rows') or [])
-                    if views_idx < len(row.get('metrics') or []) and '<' in str(row['metrics'][views_idx])
-                )
-                if bounded:
-                    print(f"   -> 상한 표기('<10K') 행: {bounded}개 → 표시된 경계값으로 계산")
+        if views_idx >= 0:
+            bounded = sum(
+                1 for row in rows
+                if views_idx < len(row.get('metrics') or []) and '<' in str(row['metrics'][views_idx])
+            )
+            if bounded:
+                print(f"   -> 상한 표기('<10K') 행: {bounded}개 → 표시된 경계값으로 계산")
 
         # Shorts 차트는 기존과 동일하게 'Shorts 생성 수'를 우선 사용한다.
         # (실패하면 DOM의 주간 조회수 값이 그대로 남는다)
@@ -656,7 +781,7 @@ def scrape_kworb(chart_key, url):
 
 # ================= 메인 실행 =================
 if __name__ == "__main__":
-    driver = None
+    session = DriverSession(get_driver)
     final_data = [] 
 
     try:
@@ -664,11 +789,11 @@ if __name__ == "__main__":
         
         # 1. 브라우저 크롤링 (YouTube / Billboard)
         try:
-            driver = get_driver()
+            session.start()
             
             # YouTube
             for name, url in TARGET_URLS.items():
-                chart_data = scrape_youtube_chart(name, url, driver)
+                chart_data = scrape_youtube_chart(name, url, session)
                 # Trending 보정: API 키가 만료(API key expired) 상태라 DOM 조회수를 우선하고,
                 # DOM에서 값을 못 얻은 경우(Views=0)에만 API 값을 보충으로 쓴다.
                 if "Trending" in name:
@@ -680,17 +805,17 @@ if __name__ == "__main__":
                                 item["Views"] = api_stats[item["Video_ID"]]
                 final_data.extend(chart_data)
             
-            # Billboard
+            # Billboard (차트 로딩 중 드라이버가 재시작됐을 수 있어 session.driver를 쓴다)
             print("\n>>> Billboard...")
             for b_name, b_url in BILLBOARD_URLS.items():
-                b_data = scrape_billboard_official(driver, b_name, b_url)
+                b_data = scrape_billboard_official(session.driver, b_name, b_url)
                 final_data.extend(b_data)
 
         except Exception as sel_e:
             print(f"🔥 Selenium Fatal Error: {sel_e}")
             print(traceback.format_exc())
         finally:
-            if driver: driver.quit()
+            session.close()
 
         # 2. Requests 크롤링
         print("\n>>> Domestic & Kworb...")
